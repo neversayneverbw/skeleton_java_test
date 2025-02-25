@@ -1,0 +1,157 @@
+name: Component Workflow
+
+on:
+  push:
+    tags:
+      - '*'
+      
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4    #当前repositoryの内容を取得
+    - name: Setup Java
+      uses: actions/setup-java@v4    #JAVA環境を配置
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: maven
+    - name: Build with Maven          #mavenでjarファイルを作成(unitテストでエラーになった場合、エラーで停止する設定にしています)
+      run: mvn --file backend/pom.xml package
+    - name: JavaDoc with Maven          #mavenでJavaDocを作成
+      if: always() 
+      run: mvn --file backend/pom.xml javadoc:aggregate-jar
+    - name: JUnit report with Maven     #mavenでJUnit reportを作成
+      if: always() 
+      run: mvn --file backend/pom.xml site -DgenerateReports=false surefire-report:report
+    - name: Upload java Build results
+      uses: actions/upload-artifact@v4
+      with:
+        name: publish-results
+        path: |
+          backend/00common/target/common-1.0.0.jar
+          backend/01MV/target/mv-1.0.0.jar
+          backend/02TR/target/tr-1.0.0.jar
+          backend/03EL/target/el-1.0.0.jar
+    - name: Upload java other-documents results
+      if: always() 
+      uses: actions/upload-artifact@v4
+      with:
+        name: other-documents
+        path: |
+          jar
+          backend/00common/target/reports
+          backend/01MV/target/reports
+          backend/02TR/target/reports
+          backend/03EL/target/reports
+
+  docker:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # required for all workflows
+      security-events: write
+      # only required for workflows in private repositories
+      actions: read
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: "panasonicconnect/cpbd/app/mv"
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/download-artifact@v4
+      with:
+        name: publish-results
+        path: publish-results
+    - name: make target directory
+      run: |
+        cd backend/01MV
+        mkdir target
+    - name: copy publish-results for docker build
+      run: cp -rf publish-results/01MV/target/mv-1.0.0.jar backend/01MV/target
+    # Dockerイメージ作成とgithubのDockerレジストリに登録
+    - name: Log in to the Container registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Extract metadata (tags, labels) for Docker
+      id: meta
+      uses: docker/metadata-action@v4
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          # branch event
+          type=ref,enable=true,priority=600,prefix=,suffix=,event=branch
+          # tag event
+          type=ref,enable=true,priority=600,prefix=,suffix=,event=tag
+          # pull request event
+          #type=ref,enable=true,priority=600,prefix=pr-,suffix=,event=pr
+    - name: Build and push Docker image
+      id: push
+      uses: docker/build-push-action@v5
+      with:
+        context:  ./backend/01MV
+        file: ./backend/01MV/Dockerfile
+        #outputs: type=tar,dest=docker-image.tar Error: buildx failed with: ERROR: multiple outputs currently unsupported by the current BuildKit daemon, please upgrade to version v0.13+ or use a single output
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+
+  release:
+    needs: docker
+    if: github.event_name == 'push'
+    permissions:
+      security-events: write
+      actions: read
+      contents: write
+      pull-requests: read
+    runs-on: ubuntu-latest
+    steps:
+    # タグをチェックアウトする
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    # タグがメインブランチに存在するか確認する
+    - name: Fail if tagged commit is not in main branch
+      run: |
+        BRANCHES=$(git branch -r --contains)
+        echo $BRANCHES
+        for BRANCH in $BRANCHES ; do
+          if [[ "$BRANCH" == "origin/main" ]]; then
+            exit 0
+          fi
+        done
+        exit 1
+    # ワークフロー実行のためにpublishしたリリースを削除する
+    - name: Delete Release
+      run: gh release delete ${{ env.RELEASE_TAG }} -y
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        RELEASE_TAG: ${{ github.ref_name }}
+    # プッシュされたタグ名をリリースのタグ、名前、バージョンに追加
+    - name: Publish Release
+      id: release
+      uses: release-drafter/release-drafter@v6
+      with:
+        publish: true
+        config-name: release-drafter.yml
+        tag: ${{ env.RELEASE_TAG }}
+        name: ${{ env.RELEASE_TAG }}
+        version: ${{ env.RELEASE_TAG }}
+        footer:
+          Dockerイメージ一覧<br>
+          https://github.com/PanasonicConnect/ldg_skeleton_java/pkgs/container/cpbd%2Fldg%2Fmv
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        RELEASE_TAG: ${{ github.ref_name }} 
